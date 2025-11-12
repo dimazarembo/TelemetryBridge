@@ -1,72 +1,94 @@
 #include "TelemetryManager.h"
 #include <QDateTime>
+#include <QUrl>
+#include <QNetworkAccessManager>
 #include <QNetworkRequest>
 #include <QNetworkReply>
-#include <QFile>
 #include <QJsonObject>
 #include <QJsonDocument>
+#include <QDomDocument>
 #include <QDebug>
 
-TelemetryManager::TelemetryManager(QObject *parent) : QObject(parent) {
-    // Загружаем config.json
-    QFile cfg("config.json");
-    if (cfg.open(QIODevice::ReadOnly)) {
-        QByteArray content = cfg.readAll();
-        qDebug() << "Raw content:" << content;
-        QJsonParseError err;
-        QJsonDocument doc = QJsonDocument::fromJson(content, &err);
-        if (err.error == QJsonParseError::NoError && doc.isObject()) {
-            QJsonObject obj = doc.object();
-            uuid = obj.value("uuid").toString();
-            flightId = obj.value("flight_id").toString();
-            qDebug() << "Loaded uuid:" << uuid << "flight_id:" << flightId;
-        } else {
-            qWarning() << "config.json not found or invalid. Using defaults.";
-            uuid = "0000-0000";
-            flightId = "UNKNOWN";
-        }
-        cfg.close();
-    } else {
-        qWarning() << "config.json not found or invalid. Using defaults.";
-        uuid = "0000-0000";
-        flightId = "UNKNOWN";
+TelemetryManager::TelemetryManager(QObject *parent)
+    : QObject(parent)
+{
+    //Настраиваем периодический опрос локального сервера
+    connect(&pollTimer, &QTimer::timeout, this, &TelemetryManager::pollLocalServer);
+
+    // Частота опроса — 10 Гц (100 мс)
+    pollTimer.start(100);
+}
+
+void TelemetryManager::setConfig(const QString &uuid,
+                                 const QString &flightId,
+                                 const QString &sourceEndpoint,
+                                 const QString &destEndpoint)
+{
+    // Сохраняем конфигурационные данные, полученные из config.ini
+    m_uuid = uuid;
+    m_flightId = flightId;
+    m_sourceEndpoint = sourceEndpoint;
+    m_destEndpoint = destEndpoint;
+
+    // Логируем загруженные параметры
+    /*
+    qInfo() << "  TelemetryManager configured:";
+    qInfo() << "  UUID:" << m_uuid;
+    qInfo() << "  Flight ID:" << m_flightId;
+    qInfo() << "  Source endpoint:" << m_sourceEndpoint;
+    qInfo() << "  Destination endpoint:" << m_destEndpoint;
+    */
+}
+
+void TelemetryManager::start()
+{
+    // Запуск основного процесса — просто выводим сообщение в лог
+    qDebug() << "TelemetryManager started.";
+}
+
+void TelemetryManager::pollLocalServer()
+{
+    // Проверяем, что источник данных указан в конфиге
+    if (m_sourceEndpoint.isEmpty()) {
+        qWarning() << "Source endpoint not configured!";
+        return;
     }
 
-    connect(&pollTimer, &QTimer::timeout, this, &TelemetryManager::pollLocalServer);
-    pollTimer.start(100); // 10 Гц
-}
+    // Формируем GET-запрос к локальному HTTP-серверу (источнику телеметрии)
+    const QUrl url = QUrl::fromUserInput(m_sourceEndpoint);
+    QNetworkRequest request{url};
 
-void TelemetryManager::start() {
-    qDebug() << "Telemetry manager started.";
-}
+    // Отправляем запрос и получаем ответ асинхронно
+    QNetworkReply *reply = network.get(request);
 
-void TelemetryManager::pollLocalServer() {
-    QNetworkRequest req(QUrl("http://10.241.113.130:9280/mandala"));
-    QNetworkReply *reply = network.get(req);
+    //️ Обрабатываем завершение запроса
     connect(reply, &QNetworkReply::finished, this, [this, reply]() {
         QByteArray data = reply->readAll();
-        reply->deleteLater();
-
-    //    qDebug() << "Server response:" << data;
+        reply->deleteLater(); // очищаем объект после завершения
 
         double altitude = 0, roll = 0;
+
+        // Парсим XML с локального сервера (высота и крен)
         if (parseXml(data, altitude, roll)) {
+            // Формируем JSON-пакет телеметрии
             QJsonObject json;
-            QJsonObject mission { {"flight_id", flightId} };
-            QJsonObject uas { {"altitude_abs", altitude} };
-            QJsonObject attitude { {"roll", roll} };
-            QJsonObject state {
+            QJsonObject mission{{"flight_id", m_flightId}};
+            QJsonObject uas{{"altitude_abs", altitude}};
+            QJsonObject attitude{{"roll", roll}};
+            QJsonObject state{
                 {"timestamp", QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs)},
                 {"uas", uas},
                 {"attitude", attitude}
             };
-            json["uuid"] = uuid;
+
+            json["uuid"] = m_uuid;
             json["mission"] = mission;
             json["current_state"] = state;
 
+            // Преобразуем JSON-объект в компактную строку
             QByteArray jsonData = QJsonDocument(json).toJson(QJsonDocument::Compact);
-          //  qDebug().noquote() << jsonData;
 
+            // Отправляем телеметрию на удалённый сервер
             sendTelemetry(jsonData);
         } else {
             qWarning() << "XML parse error";
@@ -74,69 +96,88 @@ void TelemetryManager::pollLocalServer() {
     });
 }
 
-bool TelemetryManager::parseXml(const QByteArray &xml, double &altitude, double &roll) {
-    QDomDocument doc;
-    if (!doc.setContent(xml)) return false;
+bool TelemetryManager::parseXml(const QByteArray &xml, double &altitude, double &roll)
+{
 
+    QDomDocument doc;
+    if (!doc.setContent(xml))
+        return false;
+
+    // Находим нужные элементы по тегам
     QDomElement root = doc.documentElement();
     QDomElement altElem = root.firstChildElement("cmd.pos.altitude");
     QDomElement rollElem = root.firstChildElement("est.att.roll");
 
-    if (altElem.isNull() || rollElem.isNull()) return false;
+    if (altElem.isNull() || rollElem.isNull())
+        return false;
 
-    //если будут числа с разделителем в виде запятой то раскоментить
-    /* bool ok1=false, ok2=false;
-    // QString altText = altElem.text().trimmed().replace(',', '.');
-    // QString rollText = rollElem.text().trimmed().replace(',', '.');
-    // altitude = altText.toDouble(&ok1);
-    // roll     = rollText.toDouble(&ok2);
-     return ok1 && ok2;*/
-
-    bool ok1=false, ok2=false;
+    // Преобразуем текстовые значения в числа
+    bool ok1 = false, ok2 = false;
     altitude = altElem.text().toDouble(&ok1);
-    roll     = rollElem.text().toDouble(&ok2);
+    roll = rollElem.text().toDouble(&ok2);
+
+    // Возвращаем true, если оба значения успешно считаны
     return ok1 && ok2;
 }
 
-void TelemetryManager::sendTelemetry(const QByteArray &json) {
-    const QUrl url("http://178.172.132.41:9090/geoevent/telemetry");
+void TelemetryManager::sendTelemetry(const QByteArray &json)
+{
+    // Проверяем наличие адреса назначения
+    if (m_destEndpoint.isEmpty()) {
+        qWarning() << "⚠️ Destination endpoint not configured!";
+        return;
+    }
 
+    // Если предыдущий POST-запрос ещё выполняется — ставим данные в очередь
     if (postInProgress) {
         buffer.enqueue(json);
         return;
     }
 
-    QNetworkRequest req(url);
-    req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+    // Формируем POST-запрос на удалённый сервер
+    const QUrl url = QUrl::fromUserInput(m_destEndpoint);
+    QNetworkRequest request{url};
+    request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
 
+    // Отмечаем, что отправка в процессе
     postInProgress = true;
 
-    QNetworkReply *reply = network.post(req, json);
+    // Отправляем JSON телеметрию (асинхронно)
+    QNetworkReply *reply = network.post(request, json);
 
+    // Обработка завершения POST-запроса
     connect(reply, &QNetworkReply::finished, this, [this, reply, json]() {
         postInProgress = false;
 
         if (reply->error() == QNetworkReply::NoError) {
+            // Успешная отправка
             qDebug() << "[POST OK]" << reply->readAll();
-            flushQueue();  // пробуем отправить, если очередь непуста
+
+            // Если очередь не пуста — отправляем следующий пакет
+            flushQueue();
         } else {
+            // Ошибка отправки — сохраняем пакет в очередь
             qWarning() << "[POST FAILED]" << reply->errorString();
-            // сохраняем именно JSON, который не отправился
             buffer.enqueue(json);
             qDebug() << "[QUEUE SIZE]" << buffer.size();
         }
 
+        // Освобождаем память
         reply->deleteLater();
     });
 }
 
+void TelemetryManager::flushQueue()
+{
+    // Проверяем, есть ли отложенные пакеты
+    if (buffer.isEmpty())
+        return;
 
-
-void TelemetryManager::flushQueue() {
-    if (buffer.isEmpty()) return;
-
+    // Берём следующий пакет из очереди
     QByteArray next = buffer.dequeue();
+
     qDebug() << "[QUEUE FLUSH]" << "sending queued packet, remaining =" << buffer.size();
+
+    // Отправляем его повторно
     sendTelemetry(next);
 }
-

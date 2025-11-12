@@ -15,11 +15,13 @@ add_executable(TelemetryBridge
     src/main.cpp
     src/TelemetryManager.cpp
     include/TelemetryManager.h
-    config.json
+    config.ini
+    include/ConfigManager.h
+    src/ConfigManager.cpp
 )
 
 target_include_directories(TelemetryBridge PRIVATE include)
 
 target_link_libraries(TelemetryBridge PRIVATE Qt6::Core Qt6::Network Qt6::Xml)
 
-configure_file(${CMAKE_SOURCE_DIR}/config.json ${CMAKE_BINARY_DIR}/config.json COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/config.ini ${CMAKE_BINARY_DIR}/config.ini COPYONLY)
